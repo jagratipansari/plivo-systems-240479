@@ -1,184 +1,57 @@
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netinet/in.h>
-#include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define INPUT_PORT 47010
-#define RELAY_PORT 47001
-
 #define PAYLOAD_SIZE 160
 #define RAW_FRAME_SIZE 164
-#define WIRE_PACKET_SIZE (2 * RAW_FRAME_SIZE)
-
-/*
- * Used in the redundant-frame sequence-number field when no previous
- * frame exists. Valid frames are expected to use normal sequence numbers.
- */
-#define INVALID_SEQUENCE UINT32_MAX
-
-static int create_udp_socket(void) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (fd < 0) {
-        perror("socket");
-    }
-
-    return fd;
-}
+#define WIRE_PAYLOAD_SIZE (RAW_FRAME_SIZE + RAW_FRAME_SIZE)
 
 int main(void) {
-    int in_fd = create_udp_socket();
-
-    if (in_fd < 0) {
+    int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in in_addr = {0};
+    in_addr.sin_family = AF_INET;
+    in_addr.sin_port = htons(47010);
+    in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof(in_addr)) < 0) {
+        perror("bind 47010");
         return 1;
     }
 
-    int reuse = 1;
-    if (setsockopt(
-            in_fd,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &reuse,
-            sizeof(reuse)
-        ) < 0) {
-        perror("setsockopt SO_REUSEADDR");
-        close(in_fd);
-        return 1;
-    }
+    int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in relay = {0};
+    relay.sin_family = AF_INET;
+    relay.sin_port = htons(47001);
+    relay.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    struct sockaddr_in input_addr;
-    memset(&input_addr, 0, sizeof(input_addr));
+    unsigned char prev_frame[RAW_FRAME_SIZE];
+    int has_prev = 0;
 
-    input_addr.sin_family = AF_INET;
-    input_addr.sin_port = htons(INPUT_PORT);
-    input_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(
-            in_fd,
-            (struct sockaddr *)&input_addr,
-            sizeof(input_addr)
-        ) < 0) {
-        perror("bind sender input port");
-        close(in_fd);
-        return 1;
-    }
-
-    int out_fd = create_udp_socket();
-
-    if (out_fd < 0) {
-        close(in_fd);
-        return 1;
-    }
-
-    struct sockaddr_in relay_addr;
-    memset(&relay_addr, 0, sizeof(relay_addr));
-
-    relay_addr.sin_family = AF_INET;
-    relay_addr.sin_port = htons(RELAY_PORT);
-    relay_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    unsigned char previous_frame[RAW_FRAME_SIZE];
-    memset(previous_frame, 0, sizeof(previous_frame));
-
-    /*
-     * Mark the initial redundant frame as invalid.
-     * The value is stored in network byte order.
-     */
-    uint32_t invalid_sequence_be = htonl(INVALID_SEQUENCE);
-    memcpy(previous_frame, &invalid_sequence_be, sizeof(invalid_sequence_be));
-
-    unsigned char input_buffer[RAW_FRAME_SIZE];
-    unsigned char wire_packet[WIRE_PACKET_SIZE];
-
-    fprintf(
-        stderr,
-        "Sender listening on 127.0.0.1:%d\n",
-        INPUT_PORT
-    );
+    unsigned char in_buf[2048];
+    unsigned char wire_buf[WIRE_PAYLOAD_SIZE];
 
     for (;;) {
-        ssize_t received = recvfrom(
-            in_fd,
-            input_buffer,
-            sizeof(input_buffer),
-            0,
-            NULL,
-            NULL
-        );
+        ssize_t n = recvfrom(in_fd, in_buf, sizeof(in_buf), 0, NULL, NULL);
+        if (n != RAW_FRAME_SIZE) continue;
 
-        if (received < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            perror("recvfrom sender input");
-            break;
+        // Wire Format: [Curr Frame (164 bytes)] + [Prev Frame (164 bytes if available, else 164 zeros)]
+        memcpy(wire_buf, in_buf, RAW_FRAME_SIZE);
+        if (has_prev) {
+            memcpy(wire_buf + RAW_FRAME_SIZE, prev_frame, RAW_FRAME_SIZE);
+        } else {
+            memset(wire_buf + RAW_FRAME_SIZE, 0, RAW_FRAME_SIZE);
         }
 
-        if (received != RAW_FRAME_SIZE) {
-            fprintf(
-                stderr,
-                "Ignoring invalid raw frame size: %zd bytes\n",
-                received
-            );
-            continue;
-        }
+        // Send current packet (Contains frame i and frame i-1)
+        sendto(out_fd, wire_buf, WIRE_PAYLOAD_SIZE, 0, (struct sockaddr *)&relay, sizeof(relay));
 
-        /*
-         * Wire format:
-         *
-         * bytes 0-163   : current raw frame
-         * bytes 164-327 : previous raw frame
-         */
-        memcpy(
-            wire_packet,
-            input_buffer,
-            RAW_FRAME_SIZE
-        );
-
-        memcpy(
-            wire_packet + RAW_FRAME_SIZE,
-            previous_frame,
-            RAW_FRAME_SIZE
-        );
-
-        ssize_t sent = sendto(
-            out_fd,
-            wire_packet,
-            sizeof(wire_packet),
-            0,
-            (struct sockaddr *)&relay_addr,
-            sizeof(relay_addr)
-        );
-
-        if (sent < 0) {
-            perror("sendto relay");
-            continue;
-        }
-
-        if (sent != WIRE_PACKET_SIZE) {
-            fprintf(
-                stderr,
-                "Partial UDP send: sent %zd of %d bytes\n",
-                sent,
-                WIRE_PACKET_SIZE
-            );
-            continue;
-        }
-
-        memcpy(
-            previous_frame,
-            input_buffer,
-            RAW_FRAME_SIZE
-        );
+        // Save current frame as previous for next iteration
+        memcpy(prev_frame, in_buf, RAW_FRAME_SIZE);
+        has_prev = 1;
     }
-
-    close(out_fd);
-    close(in_fd);
-
-    return 1;
+    return 0;
 }
