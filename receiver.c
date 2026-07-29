@@ -60,10 +60,19 @@ void* playout_thread(void* arg) {
 }
 
 int main(void) {
-    char *env_t0 = getenv("T0");
-    char *env_delay = getenv("DELAY_MS");
-    if (env_t0) g_t0 = atof(env_t0);
-    if (env_delay) g_delay_ms = atof(env_delay);
+   char *env_t0 = getenv("T0");
+   char *env_delay = getenv("DELAY_MS");
+
+   if (!env_t0) {
+       fprintf(stderr, "Error: T0 environment variable is required\n");
+       return 1;
+   }
+
+   g_t0 = atof(env_t0);
+
+   if (env_delay) {
+       g_delay_ms = atof(env_delay);
+   }
 
     memset(g_slots, 0, sizeof(g_slots));
 
