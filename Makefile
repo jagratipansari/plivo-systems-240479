@@ -1,19 +1,13 @@
 CC ?= gcc
+CFLAGS ?= -O2 -Wall -pthread
 
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
-LDLIBS ?= -pthread
-
-TARGETS := sender receiver
-
-.PHONY: all clean
-
-all: $(TARGETS)
+all: sender receiver
 
 sender: sender.c
-	$(CC) $(CFLAGS) sender.c -o sender $(LDLIBS)
+	$(CC) $(CFLAGS) -o sender sender.c
 
 receiver: receiver.c
-	$(CC) $(CFLAGS) receiver.c -o receiver $(LDLIBS)
+	$(CC) $(CFLAGS) -o receiver receiver.c
 
 clean:
-	rm -f $(TARGETS)
+	rm -f sender receiver
